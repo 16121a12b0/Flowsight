@@ -1,0 +1,315 @@
+# ❄️ FlowSight — Project Documentation
+
+> Openflow (NiFi) Job Status Dashboard, built on Snowflake Streamlit.
+> This document is the canonical project reference. For a quick feature
+> overview see `README.md`; this file covers architecture, internals,
+> operations, and maintenance in depth.
+
+---
+
+## 1. Document Control
+
+| Field | Value |
+|---|---|
+| Project | FlowSight — Openflow Job Status Dashboard |
+| Owner | Sri Sushma Vardireddy — Entain Digital Engineering |
+| Platform | Snowflake Streamlit (Streamlit-in-Snowflake) |
+| Deployment | `SNOWFLAKE_LEARNING_DB.MOON.FLOWSIGHT` |
+| Source file | `app.py` (local dev copy) → `streamlit_app.py` (deployed) |
+| Python runtime | 3.11 |
+| Last reviewed | 2026-09-23 |
+
+---
+
+## 2. Purpose & Scope
+
+### 2.1 Problem
+Openflow (Apache NiFi) runs data-ingestion process groups across ~18 runtime
+environments. Operators had no single, at-a-glance view of which jobs are
+running, completed, failed, or stopped, and had to read raw event logs in
+Snowflake to diagnose failures.
+
+### 2.2 Solution
+FlowSight reads the `OPENFLOW_EVENTS` log tables, derives a current status per
+process group, and presents it as an interactive dashboard: filterable job
+cards, failure detail drill-downs, per-job history, hourly trends, and a
+cross-runtime overview.
+
+### 2.3 In scope
+- Near-real-time status monitoring (rolling 24-hour window).
+- Failure triage via inline error messages and event history.
+- Trend visualisation and multi-runtime comparison.
+
+### 2.4 Out of scope
+- Starting/stopping/controlling Openflow jobs (read-only dashboard).
+- Long-term historical persistence or SLA reporting.
+- Alerting/notifications outside the app (no email/Slack integration).
+
+---
+
+## 3. Target Users
+
+| Persona | Use |
+|---|---|
+| Data / platform engineers | Daily health check, failure triage across runtimes |
+| On-call / support | Spot failed or long-running jobs quickly |
+| Team leads | High-level cross-runtime status via the overview tab |
+
+---
+
+## 4. Architecture
+
+### 4.1 High-level
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                 Snowflake Streamlit (FlowSight)            │
+├──────────────────────────────────────────────────────────┤
+│  Presentation (Streamlit)                                  │
+│  ├── Sidebar: runtime, filters, sort, threshold, refresh   │
+│  ├── Tab 1: Job Status (cards, summary, error drilldown)   │
+│  ├── Tab 2: Trends (hourly stacked area chart)             │
+│  └── Tab 3: All Runtimes overview table                    │
+├──────────────────────────────────────────────────────────┤
+│  Data access (Snowpark SQL, cached)                        │
+│  ├── fetch_jobs()                                          │
+│  ├── fetch_job_history()                                   │
+│  ├── fetch_failed_job_errors()                             │
+│  ├── fetch_hourly_trend()                                  │
+│  └── fetch_multi_runtime_summary()                         │
+├──────────────────────────────────────────────────────────┤
+│  Source data (Snowflake event tables)                      │
+│  ├── OPENFLOW.OPENFLOW.OPENFLOW_EVENTS                      │
+│  └── OPENFLOW_EDP.OPENFLOW_EDP.OPENFLOW_EVENTS              │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 4.2 Runtime model
+- The app runs **inside Snowflake**. It obtains its Snowpark session via
+  `get_active_session()` — there is no external connection string, and the
+  app inherits the executing user's role and privileges.
+- All compute runs on the assigned warehouse (`WH_DGTL` in the deployed
+  environment). No data leaves Snowflake.
+
+### 4.3 Data flow (per interaction)
+1. User selects a runtime and filters in the sidebar.
+2. Streamlit calls the relevant cached `fetch_*` function.
+3. The function issues a parameterised SQL query against the runtime's
+   `OPENFLOW_EVENTS` table, scoped to that runtime's Kubernetes namespace.
+4. Results return as a pandas DataFrame, are filtered/sorted in Python, and
+   rendered as cards / charts / tables.
+
+---
+
+## 5. Configuration
+
+### 5.1 Runtime registry (`RUNTIME_CONFIG`)
+Each runtime maps to an event table and a Kubernetes namespace. Two event
+tables back all runtimes:
+
+| Event table | Runtimes |
+|---|---|
+| `OPENFLOW.OPENFLOW.OPENFLOW_EVENTS` | digitalpoc, retailpoc |
+| `OPENFLOW_EDP.OPENFLOW_EDP.OPENFLOW_EVENTS` | digitaldataeng, digitaldataeng2, digitalsportseng, digitalgamingeng, digitalgamingcasinoeng, digitalgamingpokereng, digitalgamingbingoeng, digitalgamingaccounteng, digitalsportsbookmakingeng, digitalsportsbrzeng, digitalsportskafkaevents, digitalaffiliateseng, digitalextinteng, retaildataeng, retaildataeng2, retaildataeng3 |
+
+To **add a runtime**, add an entry to `RUNTIME_CONFIG` with its
+`event_table` and `namespace` (`runtime-<name>`). No other change is needed.
+
+### 5.2 Tunable constants
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `LONG_RUNNING_THRESHOLD_HOURS` | 6 | Running jobs older than this raise an alert (also adjustable in the sidebar) |
+| `AUTO_REFRESH_OPTIONS` | Off / 30s / 1m / 2m / 5m | Auto-refresh intervals |
+| `STATUS_COLORS` | — | Badge colours per status |
+
+---
+
+## 6. Status Classification
+
+Status is **derived** from the event text (`VALUE` column), not stored. The
+first matching rule wins:
+
+| Status | Trigger keywords | Colour |
+|---|---|---|
+| Failed | `Failed to synchronize`, `ERROR` | `#dc3545` (red) |
+| Stopped | `removed from flow`, `stopped`, `Stopped` | `#6c757d` (grey) |
+| Completed | `Successfully`, `checkpointed`, `completed` | `#28a745` (green) |
+| Running | default (no other match) | `#1E90FF` (blue) |
+
+> Because classification is keyword-based, unusual log phrasing can be
+> misclassified. This is a known limitation (see §12).
+
+---
+
+## 7. Query Design
+
+All status queries share a common shape:
+
+1. **Window** — only events newer than 24h before the *latest* event
+   (`TIMESTAMP > DATEADD(hour, -24, (SELECT MAX(TIMESTAMP) FROM <table>))`).
+   The window is relative to the newest event, not wall-clock now.
+2. **Extract** the job name via regex `name=([^\]\,]+)`.
+3. **Classify** status with a `CASE` expression (see §6).
+4. **Deduplicate** with `ROW_NUMBER()` partitioned by job name, ordered by
+   `TIMESTAMP DESC`; keep `rn = 1` (the most recent event per job).
+
+Common filters applied to every query:
+- Namespace matches the selected runtime.
+- `RECORD_TYPE = 'LOG'`.
+- Message contains `ProcessGroup` or `ProcessorNode`.
+- Excludes `heartbeat` / `Heartbeat` / `Protocol` noise.
+- Job name is not NULL/empty.
+
+Inputs that reach SQL (e.g. job name) are escaped for single quotes before
+interpolation.
+
+---
+
+## 8. Function Reference
+
+| Function | Cache TTL | Returns | Notes |
+|---|---|---|---|
+| `get_session()` | resource (persistent) | Snowpark session | `get_active_session()` |
+| `fetch_jobs(event_table, namespace)` | 60s | Latest status per job | Powers the Job Status tab |
+| `fetch_job_history(event_table, namespace, job_name)` | 60s | Up to 50 recent events for one job | Behind "View History" |
+| `fetch_failed_job_errors(event_table, namespace, job_name)` | 60s | Up to 10 error rows for one job | Latest 5 shown inline |
+| `fetch_hourly_trend(event_table, namespace)` | 120s | Hourly count by status | Powers the Trends tab |
+| `fetch_multi_runtime_summary()` | 300s | Per-runtime status counts | Iterates all runtimes sequentially |
+
+UI helpers: `status_badge()`, `render_job_card()`, `render_trend_chart()`,
+`render_multi_runtime_overview()`, and `main()` (page setup, tabs, sidebar,
+auto-refresh loop).
+
+---
+
+## 9. User Interface
+
+### 9.1 Sidebar
+- Runtime selector (all configured runtimes).
+- Status checkboxes: Running/Completed on by default, Stopped off, Failed on.
+- Sort: Status, Name A–Z / Z–A, Last Seen newest/oldest.
+- Alert threshold (1–24h).
+- Auto-refresh interval with live countdown.
+- Manual "Refresh Now" (clears cache and reruns).
+
+### 9.2 Tab 1 — Job Status
+- Summary metrics (Total / Running / Completed / Failed / Stopped).
+- Search box with wildcard support (`*kafka*`) over name and path.
+- Long-running banner listing offending jobs.
+- Optional Summary view: status breakdown + per-folder pivot.
+- Job cards grouped by status (Failed → Running → Completed → Stopped), each
+  expandable to show metadata, inline error details (failed jobs), and a
+  full 24h history toggle.
+
+### 9.3 Tab 2 — Trends
+- Hourly stacked area chart of job counts by status for the selected runtime.
+
+### 9.4 Tab 3 — All Runtimes
+- Table of counts per status per runtime, plus aggregate failure/running
+  banners across all runtimes.
+
+### 9.5 Theming
+- Inherits the user's Snowsight light/dark theme automatically; no toggle.
+
+---
+
+## 10. Caching & Refresh
+
+- Read functions are cached with `st.cache_data` (TTLs in §8); the session is
+  cached with `st.cache_resource`.
+- Manual refresh and auto-refresh both call `st.cache_data.clear()` then
+  `st.rerun()`, so a refresh always re-queries Snowflake.
+- Auto-refresh is driven by comparing elapsed time against the selected
+  interval in `st.session_state`.
+
+---
+
+## 11. Deployment & Operations
+
+### 11.1 Environment
+
+| Item | Value |
+|---|---|
+| Database.Schema | `SNOWFLAKE_LEARNING_DB.MOON` |
+| Stage | `@SNOWFLAKE_LEARNING_DB.MOON.MOON_STAGE` |
+| Warehouse | `WH_DGTL` |
+| Role | `RL_DIGITAL_DEVETL_VH_W` |
+| Deployed entrypoint | `streamlit_app.py` on the stage |
+
+### 11.2 Update paths
+1. **Snowsight UI** — edit in the Streamlit editor and save (applies
+   immediately). Best for quick fixes.
+2. **Stage upload (programmatic)** — load code into a temp table and run a
+   Python stored procedure that writes it to the stage (see README §Deployment
+   for the exact SQL). Best for repeatable deploys.
+3. **SnowSQL CLI** — `PUT file://./app.py @...MOON_STAGE/streamlit_app.py
+   AUTO_COMPRESS=FALSE OVERWRITE=TRUE`.
+
+> Keep the local `app.py` and the deployed `streamlit_app.py` in sync. The
+> local copy is the source of truth for review; the stage copy is what runs.
+
+### 11.3 Dependencies
+`streamlit`, `pandas`, `snowflake-snowpark-python` — all provided by the
+Snowflake Streamlit runtime; no external installs.
+
+### 11.4 Permissions
+The executing role needs read access to both `OPENFLOW_EVENTS` tables and
+usage on the warehouse. FlowSight performs no writes.
+
+---
+
+## 12. Known Limitations
+
+1. **Rolling 24h window** — only the last 24h relative to the newest event is
+   shown; older activity is invisible.
+2. **Keyword classification** — status can be misread when log phrasing is
+   atypical.
+3. **No historical persistence** — the app is a live view; nothing is stored
+   for long-term trend/SLA analysis.
+4. **Sequential multi-runtime queries** — the overview tab queries each
+   runtime one at a time, so it slows as runtimes grow.
+5. **In-Snowflake only** — relies on `get_active_session()`; running locally
+   with `streamlit run` requires adapting the session bootstrap to build a
+   Snowpark session from credentials.
+
+---
+
+## 13. Troubleshooting
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| "No process groups found" | No matching events in the 24h window / wrong namespace | Confirm the runtime is active; verify `namespace` in `RUNTIME_CONFIG` |
+| Job stuck as "Running" | No later Completed/Stopped event yet, or misclassification | Check event history; review classification keywords (§6) |
+| Overview tab slow | Sequential per-runtime queries | Expected; consider the enhancement in §14 |
+| Query failed error in UI | Missing read grant or warehouse access | Verify role grants (§11.4) |
+| Local run errors on session | `get_active_session()` has no active session | Deploy in Snowsight, or adapt session bootstrap for local use |
+
+---
+
+## 14. Future Enhancements
+
+- Parallelise the All-Runtimes overview queries to cut load time.
+- Persist daily snapshots to a table for real historical trends and SLAs.
+- Add configurable alerting (email/Slack) for failures and long-running jobs.
+- Make the time window user-selectable (e.g. 6h / 24h / 7d).
+- Strengthen status classification (structured status fields over keywords).
+
+---
+
+## 15. References
+
+- `README.md` — feature-level overview and deployment snippets.
+- `app.py` — application source (local dev copy).
+
+---
+
+## 16. Version History
+
+| Date | Change |
+|---|---|
+| 2026-09-23 | Added this in-depth project documentation |
+| 2026-08-20 | Removed Duration tab and manual theme toggle; added auto Snowsight theme support |
+| 2026-08-18 | Added Job Run History, Error Details, Auto-Refresh; replaced CSV export with Summary |
+| 2026-08-04 | Previous deployment (original version) |
+| 2026-06-09 | Initial FlowSight creation |
