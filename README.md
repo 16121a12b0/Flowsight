@@ -196,4 +196,3 @@ flowsight/
 
 **Sri Sushma Vardireddy** — Data Engineer
 
-📧 _add your email_ · 🔗 _add your LinkedIn_
